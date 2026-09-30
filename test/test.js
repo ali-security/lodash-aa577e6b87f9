@@ -18726,7 +18726,7 @@
 
       lodashStable.each(paths, function(path) {
         func(0, path, updater);
-        assert.strictEqual(0..a, value);
+        assert.strictEqual(0..a, undefined);
         delete numberProto.a;
       });
 
@@ -18734,6 +18734,32 @@
         func(object, path, updater);
         assert.strictEqual(stringProto.replace.b, value);
         delete stringProto.replace.b;
+      });
+    });
+
+    QUnit.test('`_.' + methodName + '` should not pollute `Object.prototype`', function(assert) {
+      assert.expect(10);
+
+      var paths = [
+        '__proto__.polluted',
+        ['__proto__', 'polluted'],
+        [['__proto__'], 'polluted'],
+        [Object('__proto__'), 'polluted'],
+        'constructor.prototype.polluted',
+        ['constructor', 'prototype', 'polluted'],
+        'a.__proto__.polluted',
+        ['a', 'constructor', 'prototype', 'polluted'],
+        'b.prototype.polluted',
+        ['b', 'prototype', 'polluted']
+      ];
+
+      lodashStable.each(paths, function(path) {
+        func({ 'a': {}, 'b': Object }, path, updater);
+
+        var actual = 'polluted' in objectProto;
+        delete objectProto.polluted;
+
+        assert.notOk(actual);
       });
     });
 
@@ -23647,6 +23673,59 @@
       else {
         skipAssert(assert);
       }
+    });
+  });
+
+  // zipObjectDeep prototype pollution
+  ['__proto__', 'constructor', 'prototype'].forEach(function (keyToTest) {
+    QUnit.test('zipObjectDeep is not setting ' + keyToTest + ' on global', function (assert) {
+      assert.expect(1);
+
+      _.zipObjectDeep([keyToTest + '.a'], ['newValue']);
+      // Can't access plain `a` as it's not defined and test fails
+      assert.notEqual(root['a'], 'newValue');
+    });
+
+    QUnit.test('zipObjectDeep is not overwriting ' + keyToTest + ' on vars', function (assert) {
+      assert.expect(3);
+
+      var b = 'oldValue';
+      _.zipObjectDeep([keyToTest + '.b'], ['newValue']);
+      assert.equal(b, 'oldValue');
+      assert.notEqual(root['b'], 'newValue');
+
+      // ensure nothing was created
+      assert.notOk(root['b']);
+    });
+
+    QUnit.test('zipObjectDeep is not overwriting global.' + keyToTest, function (assert) {
+      assert.expect(2);
+
+      _.zipObjectDeep([root + '.' + keyToTest + '.c'], ['newValue']);
+      assert.notEqual(root['c'], 'newValue');
+
+      // ensure nothing was created
+      assert.notOk(root['c']);
+    });
+  });
+
+  QUnit.test('zipObjectDeep should not pollute `Object.prototype` with array paths', function(assert) {
+    assert.expect(4);
+
+    var paths = [
+      ['__proto__', 'polluted'],
+      [['__proto__'], 'polluted'],
+      ['constructor', 'prototype', 'polluted'],
+      ['x', '__proto__', 'polluted']
+    ];
+
+    lodashStable.each(paths, function(path) {
+      _.zipObjectDeep([path], ['newValue']);
+
+      var actual = 'polluted' in objectProto;
+      delete objectProto.polluted;
+
+      assert.notOk(actual);
     });
   });
 

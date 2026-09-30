@@ -3433,6 +3433,13 @@
 
       while (nested != null && ++index < length) {
         var key = path[index];
+
+        // Use loose equality so non-string keys that coerce to these names,
+        // e.g. `['__proto__']` or `Object('__proto__')`, are blocked too.
+        if (key == '__proto__' || key == 'constructor' || key == 'prototype') {
+          return object;
+        }
+
         if (isObject(nested)) {
           var newValue = value;
           if (index != lastIndex) {
