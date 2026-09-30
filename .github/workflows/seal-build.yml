@@ -1,0 +1,355 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # lodash-cli minifies lodash.min.js with the 2015 Closure Compiler jar.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Install lodash-cli 4.6.1 and build-script deps
+        run: |
+          set -eo pipefail
+          mkdir -p /tmp/cli /tmp/deps
+          cd /tmp/cli && npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund lodash-cli@4.6.1
+          cd /tmp/deps && npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund async@1.5.2 glob@7.0.0 fs-extra@0.26.5 lodash@4.5.0 uglify-js@2.6.2
+
+      - name: Teach lodash-cli about the hardened merge and template code (CVE-2019-10744)
+        run: |
+          set -eo pipefail
+          CLI_DIR=/tmp/cli/node_modules/lodash-cli
+          # closure-compiler@0.2.10 looks for its jar under a nested node_modules path,
+          # but modern npm hoists google-closure-compiler to the top level.
+          CC_DIR=/tmp/cli/node_modules/closure-compiler
+          if [ ! -e "$CC_DIR/node_modules/google-closure-compiler" ]; then
+            mkdir -p "$CC_DIR/node_modules"
+            ln -s ../../google-closure-compiler "$CC_DIR/node_modules/google-closure-compiler"
+          fi
+          test -f "$CC_DIR/node_modules/google-closure-compiler/compiler.jar"
+          java -version
+          # `baseMerge`/`baseMergeDeep` now read values through the new private `safeGet`
+          # helper; lodash-cli only knows functions listed in its dependency map.
+          cat > /tmp/cli-mapping.sed <<'EOF'
+          s/^\(  'baseMerge': \[.*'keysIn', \)\('Stack'\],\)$/\1'safeGet', \2/
+          s/^\(  'baseMergeDeep': \[.*'isTypedArray', \)\('toPlainObject'\],\)$/\1'safeGet', \2/
+          s/^  'replaceHolders': \[\],$/&\n  'safeGet': [],/
+          EOF
+          sed -i -f /tmp/cli-mapping.sed "$CLI_DIR/lib/mapping.js"
+          grep -qF "'keysIn', 'safeGet', 'Stack']," "$CLI_DIR/lib/mapping.js"
+          grep -qF "'isTypedArray', 'safeGet', 'toPlainObject']," "$CLI_DIR/lib/mapping.js"
+          test "$(grep -cxF "  'safeGet': []," "$CLI_DIR/lib/mapping.js")" = 1
+          # lodash-cli rewrites the `sourceURL` default of `_.template` for modularized and
+          # minified builds; keep the own-property check and whitespace normalization there.
+          cat > /tmp/cli-sourceurl.sed <<'EOF'
+          s|'sourceURL' in options ? '//# sourceURL=' + options\.sourceURL + '|hasOwnProperty.call(options, 'sourceURL') ? '//# sourceURL=' + (options.sourceURL + '').replace(/\\\\s/g, ' ') + '|
+          EOF
+          sed -i -f /tmp/cli-sourceurl.sed "$CLI_DIR/bin/lodash" "$CLI_DIR/lib/preprocess.js"
+          for file in "$CLI_DIR/bin/lodash" "$CLI_DIR/lib/preprocess.js"; do
+            test "$(grep -cF "hasOwnProperty.call(options, 'sourceURL') ? '//# sourceURL=' + (options.sourceURL + '').replace(/\\\\s/g, ' ') + '\\\\n' : ''" "$file")" = 1
+            if grep -qF "'sourceURL' in options" "$file"; then
+              echo "unpatched sourceURL rewrite left in $file"
+              exit 1
+            fi
+          done
+
+      - name: Teach lodash-cli about the linear-time trim helpers (CVE-2020-28500)
+        run: |
+          set -eo pipefail
+          CLI_DIR=/tmp/cli/node_modules/lodash-cli
+          # `toNumber`, `trim` and `trimEnd` no longer use the backtracking `reTrim`/`reTrimEnd`
+          # regexes; they call the new private `baseTrim`/`trimmedEndIndex` helpers, which
+          # lodash-cli only knows about through its dependency map.
+          cat > /tmp/cli-mapping-trim.sed <<'EOF'
+          s/^  'toNumber': \['isFunction', 'isObject'\],$/  'toNumber': ['baseTrim', 'isFunction', 'isObject'],/
+          s/^  'trim': \['toString', 'charsEndIndex', 'charsStartIndex', 'stringToArray'\],$/  'trim': ['baseTrim', 'toString', 'charsEndIndex', 'charsStartIndex', 'stringToArray'],/
+          s/^  'trimEnd': \['toString', 'charsEndIndex', 'stringToArray'\],$/  'trimEnd': ['toString', 'charsEndIndex', 'stringToArray', 'trimmedEndIndex'],/
+          s/^  'baseUnary': \[\],$/  'baseTrim': ['trimmedEndIndex'],\n&/
+          s/^  'unescapeHtmlChar': \[\]$/  'trimmedEndIndex': [],\n&/
+          EOF
+          sed -i -f /tmp/cli-mapping-trim.sed "$CLI_DIR/lib/mapping.js"
+          grep -qxF "  'toNumber': ['baseTrim', 'isFunction', 'isObject']," "$CLI_DIR/lib/mapping.js"
+          grep -qxF "  'trim': ['baseTrim', 'toString', 'charsEndIndex', 'charsStartIndex', 'stringToArray']," "$CLI_DIR/lib/mapping.js"
+          grep -qxF "  'trimEnd': ['toString', 'charsEndIndex', 'stringToArray', 'trimmedEndIndex']," "$CLI_DIR/lib/mapping.js"
+          test "$(grep -cxF "  'baseTrim': ['trimmedEndIndex']," "$CLI_DIR/lib/mapping.js")" = 1
+          test "$(grep -cxF "  'trimmedEndIndex': []," "$CLI_DIR/lib/mapping.js")" = 1
+          node -e "var m = require('$CLI_DIR/lib/mapping.js'); if (!m.funcDep.baseTrim || !m.funcDep.trimmedEndIndex) { process.exit(1); }"
+
+      - name: Teach lodash-cli about the template option guards (CVE-2021-23337)
+        run: |
+          set -eo pipefail
+          CLI_DIR=/tmp/cli/node_modules/lodash-cli
+          # `_.template` now validates its `imports` keys with `arrayEach` and only copies own
+          # `options`/`imports` properties with `assignWith`; lodash-cli only knows function
+          # dependencies through its dependency map.
+          cat > /tmp/cli-mapping-template.sed <<'EOF'
+          s/^  'template': \['attempt', 'toString', 'baseValues', 'escapeStringChar', 'assignInDefaults', 'assignInWith', 'isError', 'isIterateeCall', 'keys'\],$/  'template': ['arrayEach', 'attempt', 'toString', 'baseValues', 'escapeStringChar', 'assignInDefaults', 'assignWith', 'isError', 'isIterateeCall', 'keys'],/
+          EOF
+          sed -i -f /tmp/cli-mapping-template.sed "$CLI_DIR/lib/mapping.js"
+          test "$(grep -cxF "  'template': ['arrayEach', 'attempt', 'toString', 'baseValues', 'escapeStringChar', 'assignInDefaults', 'assignWith', 'isError', 'isIterateeCall', 'keys']," "$CLI_DIR/lib/mapping.js")" = 1
+          node -e "var m = require('$CLI_DIR/lib/mapping.js'), d = m.funcDep.template; if (d.indexOf('arrayEach') < 0 || d.indexOf('assignWith') < 0 || d.indexOf('assignInWith') > -1) { process.exit(1); }"
+
+      - name: Teach lodash-cli about pullAt removing paths with the hardened unset (CVE-2026-2950)
+        run: |
+          set -eo pipefail
+          CLI_DIR=/tmp/cli/node_modules/lodash-cli
+          # `basePullAt` now removes non-index paths through `baseUnset`, which blocks
+          # `__proto__`/`constructor`/`prototype` traversal; lodash-cli only knows
+          # function dependencies through its dependency map.
+          cat > /tmp/cli-mapping-pullat.sed <<'EOF'
+          s/^  'basePullAt': \[[^]]*\],$/  'basePullAt': ['baseUnset', 'isIndex'],/
+          EOF
+          sed -i -f /tmp/cli-mapping-pullat.sed "$CLI_DIR/lib/mapping.js"
+          test "$(grep -cxF "  'basePullAt': ['baseUnset', 'isIndex']," "$CLI_DIR/lib/mapping.js")" = 1
+          node -e "var m = require('$CLI_DIR/lib/mapping.js'), d = m.funcDep.basePullAt; if (d.join() !== 'baseUnset,isIndex') { process.exit(1); }"
+
+      - name: Modularize this repo's lodash.js with lodash-cli
+        run: |
+          set -eo pipefail
+          CLI_DIR=/tmp/cli/node_modules/lodash-cli
+          LODASH_JS=$(node -e "console.log(require.resolve('lodash',{paths:['$CLI_DIR']}))")
+          cp "$GITHUB_WORKSPACE/lodash.js" "$LODASH_JS"
+          mkdir -p /tmp/art/foo
+          cd /tmp/art
+          node "$CLI_DIR/bin/lodash" modularize exports=node -o ./foo
+          node "$CLI_DIR/bin/lodash" -d -o ./foo/lodash.js
+          # Re-minify the patched source; the committed dist/lodash.min.js predates the fix.
+          mkdir -p /tmp/min
+          cd /tmp/min
+          node "$CLI_DIR/bin/lodash" -o ./dist/lodash.js
+          ls -l /tmp/min/dist/lodash.min.js
+
+      - name: Add core/min/fp modules, LICENSE and npm README/package.json
+        run: |
+          set -eo pipefail
+          export NODE_PATH=/tmp/deps/node_modules
+          node lib/main/build-modules.js /tmp/art/foo
+          node lib/fp/build-modules.js /tmp/art/foo
+          cp /tmp/min/dist/lodash.min.js /tmp/art/foo/lodash.min.js
+          cp LICENSE npm-extras/README.md npm-extras/package.json /tmp/art/foo/
+
+      - name: Smoke test the packaged merge and template modules
+        run: |
+          set -eo pipefail
+          grep -qF "require('./_safeGet')" /tmp/art/foo/_baseMergeDeep.js
+          grep -qF "require('./_safeGet')" /tmp/art/foo/_baseMerge.js
+          grep -qF "hasOwnProperty.call(options, 'sourceURL')" /tmp/art/foo/template.js
+          grep -qF "hasOwnProperty.call(options, 'variable')" /tmp/art/foo/template.js
+          grep -qF "require('./_arrayEach')" /tmp/art/foo/template.js
+          grep -qF "require('./assignWith')" /tmp/art/foo/template.js
+          grep -qF "var reForbiddenIdentifierChars = /[()=,{}\[\]\/\s]/;" /tmp/art/foo/template.js
+          grep -qF "throw new Error(INVALID_TEMPL_VAR_ERROR_TEXT);" /tmp/art/foo/template.js
+          grep -qF "throw new Error(INVALID_TEMPL_IMPORTS_ERROR_TEXT);" /tmp/art/foo/template.js
+          if grep -qF "assignInWith" /tmp/art/foo/template.js; then
+            echo "template.js still copies inherited options/imports with assignInWith"
+            exit 1
+          fi
+          grep -qF "require('./_baseTrim')" /tmp/art/foo/toNumber.js
+          grep -qF "require('./_baseTrim')" /tmp/art/foo/trim.js
+          grep -qF "require('./_trimmedEndIndex')" /tmp/art/foo/trimEnd.js
+          grep -qF "require('./_trimmedEndIndex')" /tmp/art/foo/_baseTrim.js
+          grep -qF "var reTrimStart = /^\s+/;" /tmp/art/foo/_baseTrim.js
+          grep -qF "var reWhitespace = /\s/;" /tmp/art/foo/_trimmedEndIndex.js
+          if grep -lE "\breTrim(End)?\b" /tmp/art/foo/*.js; then
+            echo "backtracking reTrim/reTrimEnd left in packaged modules"
+            exit 1
+          fi
+          grep -qF "require('./_baseUnset')" /tmp/art/foo/_basePullAt.js
+          grep -qF "hasOwnProperty.call(object, '__proto__')" /tmp/art/foo/_baseUnset.js
+          node <<'EOF'
+          var assert = require('assert'),
+              path = require('path');
+
+          var dir = '/tmp/art/foo',
+              terminators = ['\n', '\r', String.fromCharCode(8232), String.fromCharCode(8233)];
+
+          function load(name) {
+            return require(path.join(dir, name));
+          }
+
+          function checkMerge(label, defaultsDeep, merge, mergeWith) {
+            defaultsDeep({}, { 'constructor': { 'prototype': { 'sealPolluted': 1 } } });
+            defaultsDeep({}, { 'constructor': { 'sealPolluted': 1 } });
+            defaultsDeep({}, JSON.parse('{"__proto__":{"sealPolluted":1}}'));
+            merge({}, { 'constructor': { 'prototype': { 'sealPolluted': 1 } } });
+            merge({}, JSON.parse('{"__proto__":{"sealPolluted":1}}'));
+            mergeWith({}, { 'constructor': { 'sealPolluted': 1 } }, function() {});
+            assert.ok(!('sealPolluted' in Object.prototype), label + ': Object.prototype polluted');
+            assert.ok(!('sealPolluted' in Object), label + ': Object polluted');
+            assert.deepStrictEqual(defaultsDeep({ 'a': { 'b': 2 } }, { 'a': { 'b': 1, 'c': 3 } }), { 'a': { 'b': 2, 'c': 3 } }, label);
+            assert.deepStrictEqual(merge({ 'a': [1] }, { 'a': [2, 3] }), { 'a': [2, 3] }, label);
+          }
+
+          function checkTemplate(label, template) {
+            var sink = { 'hits': 0 };
+            terminators.forEach(function(terminator) {
+              template('x', { 'imports': { 'sink': sink }, 'sourceURL': 'a' + terminator + 'sink.hits++' });
+            });
+            assert.strictEqual(sink.hits, 0, label + ': sourceURL code injection');
+            assert.strictEqual(template('<%= a %>')({ 'a': 1 }), '1', label);
+            assert.strictEqual(template('<%= data.a %>', { 'variable': 'data' })({ 'a': 2 }), '2', label);
+
+            // CVE-2021-23337: `variable` option code injection.
+            var compiled;
+            assert.throws(function() {
+              compiled = template('', { 'imports': { 'sink': sink }, 'variable': '){sink.hits++}; with(obj' });
+            }, /Invalid `variable` option/, label);
+            if (compiled) {
+              compiled();
+            }
+            assert.strictEqual(sink.hits, 0, label + ': variable code injection');
+
+            // `imports` key default-parameter injection.
+            ['a = (sink.hits++, 1)', 'a=(sink.hits++,1)'].forEach(function(key) {
+              var imports = { 'sink': sink };
+              imports[key] = undefined;
+              assert.throws(function() {
+                template('x', { 'imports': imports });
+              }, /Invalid `imports` option/, label);
+            });
+            assert.strictEqual(sink.hits, 0, label + ': imports key code injection');
+
+            // Inherited `imports` keys and a polluted `Object.prototype`.
+            var proto = {};
+            proto['a = (sink.hits++, 1)'] = undefined;
+            var polluted = Object.create(proto);
+            polluted.sink = sink;
+            assert.strictEqual(template('x', { 'imports': polluted })(), 'x', label);
+            Object.prototype['a = (sink.hits++, 1)'] = undefined;
+            try {
+              assert.strictEqual(template('x', { 'imports': { 'sink': sink } })(), 'x', label);
+            } finally {
+              delete Object.prototype['a = (sink.hits++, 1)'];
+            }
+            assert.strictEqual(sink.hits, 0, label + ': inherited imports key code injection');
+          }
+
+          function checkTrim(label, _) {
+            var largeStr = '1' + new Array(50001).join(' ') + '1',
+                startTime = Date.now();
+
+            assert.ok(isNaN(_.toNumber(largeStr)), label + ': toNumber');
+            assert.strictEqual(_.toInteger(largeStr), 0, label + ': toInteger');
+            assert.strictEqual(_.trim(largeStr), largeStr, label + ': trim');
+            assert.strictEqual(_.trimEnd(largeStr), largeStr, label + ': trimEnd');
+            assert.strictEqual(_.trimStart(largeStr), largeStr, label + ': trimStart');
+            assert.strictEqual(_.parseInt(largeStr), 1, label + ': parseInt');
+            var timeSpent = Date.now() - startTime;
+            assert.ok(timeSpent < 1000, label + ': trim ReDoS, took ' + timeSpent + 'ms');
+
+            assert.strictEqual(_.trim(' \t\n a b ' + String.fromCharCode(160, 65279)), 'a b', label);
+            assert.strictEqual(_.trimEnd('  a b  '), '  a b', label);
+            assert.strictEqual(_.trimStart('  a b  '), 'a b  ', label);
+            assert.strictEqual(_.trim('-_-a-_-', '_-'), 'a', label);
+            assert.strictEqual(_.trim('   '), '', label);
+            assert.strictEqual(_.trimEnd('   '), '', label);
+            assert.strictEqual(_.toNumber(' 12.5 '), 12.5, label);
+            assert.strictEqual(_.toNumber(' 0b101010 '), 42, label);
+            assert.strictEqual(_.toNumber(' 0o12345 '), 5349, label);
+            assert.ok(isNaN(_.toNumber(' -0x1a ')), label);
+            assert.strictEqual(_.parseInt(' 0x20 '), 32, label);
+            assert.strictEqual(_.parseInt(' 08 '), 8, label);
+          }
+
+          function checkUnset(label, unset, pullAt) {
+            var protos = [Object.prototype, Array.prototype, Function.prototype, Number.prototype, String.prototype],
+                paths = [
+                  '__proto__.sealPolluted',
+                  'constructor.prototype.sealPolluted',
+                  'a.__proto__.sealPolluted',
+                  'a.constructor.prototype.sealPolluted',
+                  'toString.constructor.prototype.sealPolluted',
+                  ['__proto__', 'sealPolluted'],
+                  [['__proto__'], ['sealPolluted']],
+                  ['a', ['__proto__'], 'sealPolluted'],
+                  [['constructor'], ['prototype'], ['sealPolluted']],
+                  ['constructor', ['prototype'], 'sealPolluted']
+                ];
+
+            // CVE-2025-13465 / CVE-2026-2950: deleting prototype properties via `__proto__`,
+            // `constructor.prototype` and array-wrapped path segments.
+            protos.forEach(function(proto) { proto.sealPolluted = 1; });
+            try {
+              paths.forEach(function(path) {
+                var name = label + ': ' + JSON.stringify(path);
+                assert.strictEqual(unset({ 'a': {} }, path), false, name);
+                assert.strictEqual(unset({ 'a': '' }, path), false, name);
+                assert.strictEqual(unset(0, path), false, name);
+                // An own `__proto__` on the root must not open nested `__proto__` segments.
+                unset(JSON.parse('{"__proto__":{},"a":{}}'), path);
+                pullAt([], path);
+                pullAt([], [path]);
+              });
+              protos.forEach(function(proto) {
+                assert.strictEqual(proto.sealPolluted, 1, label + ': prototype property deleted');
+              });
+            } finally {
+              protos.forEach(function(proto) { delete proto.sealPolluted; });
+            }
+            assert.strictEqual(unset({}, 'constructor.keys'), false, label);
+            assert.strictEqual(unset({}, [['constructor'], ['keys']]), false, label);
+            assert.strictEqual(typeof Object.keys, 'function', label + ': Object.keys deleted');
+
+            // Regular paths, own terminal `constructor`/`prototype` keys and an own `__proto__`.
+            var object = { 'a': { 'b': 1, 'constructor': 2, 'prototype': 3 } };
+            assert.strictEqual(unset(object, 'a.b'), true, label);
+            assert.strictEqual(unset(object, 'a.constructor'), true, label);
+            assert.strictEqual(unset(object, ['a', 'prototype']), true, label);
+            assert.deepStrictEqual(object, { 'a': {} }, label);
+            object = JSON.parse('{"__proto__":{"b":1}}');
+            assert.strictEqual(unset(object, '__proto__.b'), true, label);
+            assert.deepStrictEqual(Object.getOwnPropertyDescriptor(object, '__proto__').value, {}, label);
+            var array = [1, 2, 3];
+            array.a = { 'b': { 'c': 4 } };
+            assert.deepStrictEqual(pullAt(array, 1, 'a.b.c'), [2, 4], label);
+            assert.deepStrictEqual(array.slice(), [1, 3], label);
+            assert.deepStrictEqual(array.a, { 'b': {} }, label);
+          }
+
+          ['lodash.js', 'lodash.min.js'].forEach(function(file) {
+            var _ = load(file);
+            checkMerge(file, _.defaultsDeep, _.merge, _.mergeWith);
+            checkTemplate(file, _.template);
+            checkTrim(file, _);
+            checkUnset(file, _.unset, _.pullAt);
+          });
+          checkMerge('modules', load('defaultsDeep'), load('merge'), load('mergeWith'));
+          checkTemplate('template.js', load('template'));
+          checkTrim('modules', {
+            'parseInt': load('parseInt'),
+            'toInteger': load('toInteger'),
+            'toNumber': load('toNumber'),
+            'trim': load('trim'),
+            'trimEnd': load('trimEnd'),
+            'trimStart': load('trimStart')
+          });
+          checkUnset('modules', load('unset'), load('pullAt'));
+          console.log('merge/template/trim/unset smoke tests passed');
+          EOF
+
+      - name: Pack
+        run: |
+          set -eo pipefail
+          cd /tmp/art/foo
+          npm pack --ignore-scripts
+          ls -l /tmp/art/foo/lodash-4.6.1.tgz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lodash-4.6.1
+          path: /tmp/art/foo/lodash-4.6.1.tgz
+          if-no-files-found: error
