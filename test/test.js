@@ -14104,20 +14104,14 @@
 
       var source1 = { 'a': function() {} },
           source2 = { 'a': { 'b': 1 } },
-          actual = _.merge({}, source1, source2),
-          expected = { 'a': { 'b': 1 } };
+          expected = { 'a': { 'b': 1 } },
+          actual = _.merge({}, source1, source2);
 
       assert.deepEqual(actual, expected);
-
-      source1 = { 'a': function() {} };
-      source2 = { 'a': { 'b': 1 } };
-
-      expected = { 'a': function() {} };
-      expected.a.b = 1;
+      assert.notOk('b' in source1.a);
 
       actual = _.merge(source1, source2);
-      assert.strictEqual(typeof actual.a, 'function');
-      assert.strictEqual(actual.a.b, 1);
+      assert.deepEqual(actual, expected);
     });
 
     QUnit.test('should merge onto non-plain `object` values', function(assert) {
@@ -14443,6 +14437,18 @@
       delete objectProto.a;
 
       assert.notOk(actual);
+    });
+
+    QUnit.test('should not merge onto inherited builtin function values', function(assert) {
+      assert.expect(2);
+
+      var actual = _.merge({}, JSON.parse('{"toString":{"a":1}}')),
+          polluted = 'a' in objectProto.toString;
+
+      delete objectProto.toString.a;
+
+      assert.notOk(polluted);
+      assert.strictEqual(actual.toString.a, 1);
     });
   }(1, 2, 3));
 

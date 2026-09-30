@@ -3241,7 +3241,7 @@
           if (isArguments(objValue)) {
             newValue = toPlainObject(objValue);
           }
-          else if (!isObject(objValue) || (srcIndex && isFunction(objValue))) {
+          else if (!isObject(objValue) || isFunction(objValue)) {
             isCommon = false;
             newValue = baseClone(srcValue, !customizer);
           }
