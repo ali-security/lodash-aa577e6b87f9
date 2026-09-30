@@ -3406,16 +3406,8 @@
           if (isIndex(index)) {
             splice.call(array, index, 1);
           }
-          else if (!isKey(index, array)) {
-            var path = baseCastPath(index),
-                object = parent(array, path);
-
-            if (object != null) {
-              delete object[last(path)];
-            }
-          }
           else {
-            delete array[index];
+            baseUnset(array, index);
           }
         }
       }
@@ -3754,8 +3746,39 @@
      */
     function baseUnset(object, path) {
       path = isKey(path, object) ? [path + ''] : baseCastPath(path);
+
+      // Prevent prototype pollution:
+      // https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg
+      // https://github.com/lodash/lodash/security/advisories/GHSA-f23m-r3pf-42rh
+      // https://github.com/lodash/lodash/security/advisories/GHSA-w36w-cm3g-pc62
+      var index = -1,
+          length = path.length;
+
+      if (!length) {
+        return true;
+      }
+
+      while (++index < length) {
+        // Coerce each segment the way property access does so array-wrapped or
+        // boxed segments, like `['__proto__']`, are checked as their keys.
+        var key = String(path[index]);
+
+        // Always block "__proto__" anywhere in the path if it's not expected.
+        // Only an own "__proto__" of `object` is expected; past the root it
+        // resolves against a nested value rather than `object`.
+        if (key == '__proto__' && (index || !hasOwnProperty.call(object, '__proto__'))) {
+          return false;
+        }
+
+        // Block constructor/prototype as non-terminal traversal keys to prevent
+        // escaping the object graph into built-in constructors and prototypes.
+        if ((key == 'constructor' || key == 'prototype') && index < length - 1) {
+          return false;
+        }
+      }
+
       object = parent(object, path);
-      var key = last(path);
+      key = last(path);
       return (object != null && has(object, key)) ? delete object[key] : true;
     }
 
