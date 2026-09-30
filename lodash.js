@@ -120,10 +120,11 @@
   var reRegExpChar = /[\\^$.*+?()[\]{}|]/g,
       reHasRegExpChar = RegExp(reRegExpChar.source);
 
-  /** Used to match leading and trailing whitespace. */
-  var reTrim = /^\s+|\s+$/g,
-      reTrimStart = /^\s+/,
-      reTrimEnd = /\s+$/;
+  /** Used to match leading whitespace. */
+  var reTrimStart = /^\s+/;
+
+  /** Used to match a single whitespace character. */
+  var reWhitespace = /\s/;
 
   /** Used to match backslashes in property paths. */
   var reEscapeChar = /\\(\\)?/g;
@@ -909,6 +910,19 @@
   }
 
   /**
+   * The base implementation of `_.trim`.
+   *
+   * @private
+   * @param {string} string The string to trim.
+   * @returns {string} Returns the trimmed string.
+   */
+  function baseTrim(string) {
+    return string
+      ? string.slice(0, trimmedEndIndex(string) + 1).replace(reTrimStart, '')
+      : string;
+  }
+
+  /**
    * The base implementation of `_.unary` without support for storing wrapper metadata.
    *
    * @private
@@ -1265,6 +1279,21 @@
    */
   function stringToArray(string) {
     return string.match(reComplexSymbol);
+  }
+
+  /**
+   * Used by `_.trim` and `_.trimEnd` to get the index of the last non-whitespace
+   * character of `string`.
+   *
+   * @private
+   * @param {string} string The string to inspect.
+   * @returns {number} Returns the index of the last non-whitespace character.
+   */
+  function trimmedEndIndex(string) {
+    var index = string.length;
+
+    while (index-- && reWhitespace.test(string.charAt(index))) {}
+    return index;
   }
 
   /**
@@ -10793,7 +10822,7 @@
       if (typeof value != 'string') {
         return value === 0 ? value : +value;
       }
-      value = value.replace(reTrim, '');
+      value = baseTrim(value);
       var isBinary = reIsBinary.test(value);
       return (isBinary || reIsOctal.test(value))
         ? freeParseInt(value.slice(2), isBinary ? 2 : 8)
@@ -12726,7 +12755,7 @@
       } else if (radix) {
         radix = +radix;
       }
-      string = toString(string).replace(reTrim, '');
+      string = toString(string).replace(reTrimStart, '');
       return nativeParseInt(string, radix || (reHasHexPrefix.test(string) ? 16 : 10));
     }
 
@@ -13173,7 +13202,7 @@
         return string;
       }
       if (guard || chars === undefined) {
-        return string.replace(reTrim, '');
+        return baseTrim(string);
       }
       chars = (chars + '');
       if (!chars) {
@@ -13211,7 +13240,7 @@
         return string;
       }
       if (guard || chars === undefined) {
-        return string.replace(reTrimEnd, '');
+        return string.slice(0, trimmedEndIndex(string) + 1);
       }
       chars = (chars + '');
       if (!chars) {
