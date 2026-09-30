@@ -20613,6 +20613,48 @@
       }
     });
 
+    QUnit.test('should forbid code injection through the "variable" options', function(assert) {
+      assert.expect(1);
+
+      assert.raises(function () {
+        _.template('', { 'variable': '){console.log(process.env)}; with(obj' });
+      });
+    });
+
+    QUnit.test('should not execute code injected through the "variable" option', function(assert) {
+      assert.expect(2);
+
+      var compiled,
+          sink = { 'hits': 0 };
+
+      assert.raises(function() {
+        compiled = _.template('', {
+          'imports': { 'sink': sink },
+          'variable': '){sink.hits++}; with(obj'
+        });
+      }, /Invalid `variable` option/);
+
+      if (compiled) {
+        lodashStable.attempt(compiled);
+      }
+      assert.strictEqual(sink.hits, 0);
+    });
+
+    QUnit.test('should throw for "variable" options containing forbidden characters', function(assert) {
+      var values = ['a,b', 'a=b', 'a)', '(a', '{a}', '[a]', 'a/**/', 'a b', 'a\nb', 'a\tb'];
+
+      assert.expect(values.length + 1);
+
+      lodashStable.each(values, function(value) {
+        assert.raises(function() {
+          _.template('', { 'variable': value });
+        }, /Invalid `variable` option/, lodashStable.escape(value));
+      });
+
+      var compiled = _.template('<%= $data.a %><%= _data.b %>', { 'variable': '$data', 'imports': { '_data': { 'b': 2 } } });
+      assert.strictEqual(compiled({ 'a': 1 }), '12');
+    });
+
     QUnit.test('should support custom delimiters', function(assert) {
       assert.expect(2);
 
@@ -21025,6 +21067,60 @@
       });
 
       assert.deepEqual(actual, ['one', '&#96;two&#96;', 'three']);
+    });
+
+    QUnit.test('should not execute code via malicious imports key names', function(assert) {
+      var keys = ['a = (sink.hits++, 1)', 'a=(sink.hits++,1)', 'a,b', 'a/**/', 'a b'];
+
+      assert.expect(keys.length + 1);
+
+      var sink = { 'hits': 0 };
+
+      lodashStable.each(keys, function(key) {
+        var imports = { 'sink': sink };
+        imports[key] = undefined;
+
+        assert.raises(function() {
+          _.template('hello', { 'imports': imports });
+        }, /Invalid `imports` option/, key);
+      });
+
+      assert.strictEqual(sink.hits, 0);
+    });
+
+    QUnit.test('should not enumerate inherited keys from imports sources', function(assert) {
+      assert.expect(2);
+
+      var sink = { 'hits': 0 },
+          proto = {};
+
+      proto['a = (sink.hits++, 1)'] = undefined;
+
+      var polluted = lodashStable.create(proto, { 'sink': sink });
+      polluted._ = _;
+
+      var actual = lodashStable.attempt(function() {
+        return _.template('hello', { 'imports': polluted })();
+      });
+
+      assert.strictEqual(actual, 'hello');
+      assert.strictEqual(sink.hits, 0);
+    });
+
+    QUnit.test('should not use inherited `Object.prototype` keys as options or imports', function(assert) {
+      assert.expect(2);
+
+      var sink = { 'hits': 0 },
+          key = 'a = (sink.hits++, 1)';
+
+      objectProto[key] = undefined;
+      var actual = lodashStable.attempt(function() {
+        return _.template('hello', { 'imports': { 'sink': sink } })();
+      });
+      delete objectProto[key];
+
+      assert.strictEqual(actual, 'hello');
+      assert.strictEqual(sink.hits, 0);
     });
   }());
 
