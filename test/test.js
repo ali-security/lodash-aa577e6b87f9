@@ -4418,6 +4418,48 @@
       var actual = _.defaultsDeep({ 'a': ['abc'] }, { 'a': 'abc' });
       assert.deepEqual(actual, { 'a': ['abc'] });
     });
+
+    QUnit.test('should not indirectly merge builtin prototype properties', function(assert) {
+      assert.expect(2);
+
+      function Foo() {}
+
+      _.defaultsDeep({ 'a': Foo }, { 'a': { 'constructor': { 'prototype': { 'b': 1 } } } });
+
+      var actual = 'b' in funcProto;
+      delete funcProto.b;
+
+      assert.notOk(actual);
+
+      _.defaultsDeep({}, { 'constructor': { 'prototype': { 'a': 1 } } });
+
+      actual = 'a' in objectProto;
+      delete objectProto.a;
+
+      assert.notOk(actual);
+    });
+
+    QUnit.test('should not indirectly merge `Object` properties', function(assert) {
+      assert.expect(1);
+
+      _.defaultsDeep({}, { 'constructor': { 'a': 1 } });
+
+      var actual = 'a' in Object;
+      delete Object.a;
+
+      assert.notOk(actual);
+    });
+
+    QUnit.test('should not merge `__proto__` properties', function(assert) {
+      assert.expect(1);
+
+      _.defaultsDeep({}, JSON.parse('{"__proto__":{"a":1}}'));
+
+      var actual = 'a' in objectProto;
+      delete objectProto.a;
+
+      assert.notOk(actual);
+    });
   }());
 
   /*--------------------------------------------------------------------------*/
@@ -14360,6 +14402,48 @@
 
       assert.deepEqual(actual, expected);
     });
+
+    QUnit.test('should not indirectly merge builtin prototype properties', function(assert) {
+      assert.expect(2);
+
+      function Foo() {}
+
+      _.merge({ 'a': Foo }, { 'a': { 'constructor': { 'prototype': { 'b': 1 } } } });
+
+      var actual = 'b' in funcProto;
+      delete funcProto.b;
+
+      assert.notOk(actual);
+
+      _.merge({}, { 'constructor': { 'prototype': { 'a': 1 } } });
+
+      actual = 'a' in objectProto;
+      delete objectProto.a;
+
+      assert.notOk(actual);
+    });
+
+    QUnit.test('should not indirectly merge `Object` properties', function(assert) {
+      assert.expect(1);
+
+      _.merge({}, { 'constructor': { 'a': 1 } });
+
+      var actual = 'a' in Object;
+      delete Object.a;
+
+      assert.notOk(actual);
+    });
+
+    QUnit.test('should not merge `__proto__` properties', function(assert) {
+      assert.expect(1);
+
+      _.merge({}, JSON.parse('{"__proto__":{"a":1}}'));
+
+      var actual = 'a' in objectProto;
+      delete objectProto.a;
+
+      assert.notOk(actual);
+    });
   }(1, 2, 3));
 
   /*--------------------------------------------------------------------------*/
@@ -14409,6 +14493,24 @@
       });
 
       assert.deepEqual(actual, { 'a': ['a', 'b', 'c'], 'b': ['b', 'c'] });
+    });
+
+    QUnit.test('should not provide `Object` as the `constructor` destination value to `customizer`', function(assert) {
+      assert.expect(1);
+
+      var actual = [];
+
+      lodashStable.each([{ 'constructor': 1 }, { 'constructor': { 'a': 1 } }], function(source) {
+        _.mergeWith({}, source, function(objValue, srcValue, key) {
+          if (key == 'constructor') {
+            actual.push(objValue);
+          }
+        });
+      });
+
+      delete Object.a;
+
+      assert.deepEqual(actual, [undefined, undefined]);
     });
   }());
 
@@ -20839,6 +20941,34 @@
       });
 
       assert.deepEqual(actual, expected);
+    });
+
+    QUnit.test('should not allow code injection via the `sourceURL` option', function(assert) {
+      assert.expect(1);
+
+      var sink = { 'hits': 0 },
+          terminators = ['\n', '\r', String.fromCharCode(8232), String.fromCharCode(8233)];
+
+      lodashStable.each(terminators, function(terminator) {
+        lodashStable.attempt(_.template, 'x', {
+          'imports': { 'sink': sink },
+          'sourceURL': 'a' + terminator + 'sink.hits++'
+        });
+      });
+
+      assert.strictEqual(sink.hits, 0);
+    });
+
+    QUnit.test('should not allow code injection via an inherited `sourceURL` value', function(assert) {
+      assert.expect(1);
+
+      var sink = { 'hits': 0 };
+
+      objectProto.sourceURL = 'a\nsink.hits++';
+      lodashStable.attempt(_.template, 'x', { 'imports': { 'sink': sink } });
+      delete objectProto.sourceURL;
+
+      assert.strictEqual(sink.hits, 0);
     });
 
     QUnit.test('should work as an iteratee for methods like `_.map`', function(assert) {
